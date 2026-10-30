@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Golden reference outputs (regenerated per machine)
+golden/
