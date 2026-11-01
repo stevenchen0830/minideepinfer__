@@ -397,6 +397,7 @@ name = "mini-deepinfer"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "numpy" },
     { name = "pytest" },
     { name = "safetensors" },
     { name = "torch" },
@@ -405,6 +406,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "numpy", specifier = ">=2.5.4" },
     { name = "pytest", specifier = ">=9.2.0" },
     { name = "safetensors", specifier = ">=0.8.0" },
     { name = "torch", specifier = ">=2.15.0" },
