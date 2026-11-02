@@ -87,11 +87,11 @@ def ours_logits(model_dir, seqs, device, dtype):
     single = []
     for seq, rows in seqs:
         md = InputMetadata.for_prompts([seq], device=device)
-        hidden = model(md)
+        hidden = model(None, md)
         single.append(get_logits(hidden[rows], model.lm_head.weight, cfg.vocab_size).cpu())
     # All prompts packed into one forward pass (only used for the report).
     md = InputMetadata.for_prompts([s for s, _ in seqs], device=device)
-    hidden = model(md)
+    hidden = model(None, md)
     packed = []
     for (seq, rows), start in zip(seqs, md.cu_seqlens_q):
         idx = [start + r for r in rows]

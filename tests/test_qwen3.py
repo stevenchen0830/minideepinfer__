@@ -18,7 +18,7 @@ from mini_deepinfer.model_executor.model_loader import load_model
 def our_logits(model, prompts):
     """Next-token logits at every position of every prompt, one packed forward."""
     md = InputMetadata.for_prompts(prompts, device="cpu")
-    hidden = model(md)
+    hidden = model(None, md)
     logits = get_logits(hidden, model.lm_head.weight, model.cfg.vocab_size)
     return [logits[s:e] for s, e in zip(md.cu_seqlens_q[:-1], md.cu_seqlens_q[1:])]
 
@@ -89,12 +89,12 @@ def test_positions_matter(tiny_checkpoint):
     model, _ = load_model(path, device="cpu")
     (prompt,) = random_prompts([10], model.cfg.vocab_size, seed=3)
     md = InputMetadata.for_prompts([prompt], device="cpu")
-    base = get_logits(model(md), model.lm_head.weight, model.cfg.vocab_size)
+    base = get_logits(model(None, md), model.lm_head.weight, model.cfg.vocab_size)
     md.positions = md.positions + 100
-    shifted = get_logits(model(md), model.lm_head.weight, model.cfg.vocab_size)
+    shifted = get_logits(model(None, md), model.lm_head.weight, model.cfg.vocab_size)
     torch.testing.assert_close(shifted, base, rtol=1e-3, atol=1e-3)
     md.positions = torch.tensor([0, 1, 2, 3, 4, 9, 6, 7, 8, 5])  # swap two positions
-    swapped = get_logits(model(md), model.lm_head.weight, model.cfg.vocab_size)
+    swapped = get_logits(model(None, md), model.lm_head.weight, model.cfg.vocab_size)
     assert (swapped - base).abs().max() > 1e-2
 
 

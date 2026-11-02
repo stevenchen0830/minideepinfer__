@@ -13,9 +13,11 @@ A small, educational rebuild of [DeepSeek's DeepInfer](https://github.com/deepse
 | Qwen3 model: RMSNorm, RoPE, GQA attention with q/k norm, SwiGLU / Qwen3 模型 | `src/mini_deepinfer/model_executor/` | Logits vs HF in float32 on tiny random checkpoints / 用随机小检查点在 float32 下与 HF 对比 |
 | Hugging Face weight loading: config reader, name map, safetensors reader, load plan / 权重加载 | `src/mini_deepinfer/hugging_face/` | Failure cases: missing, wrong shape or dtype, truncated files / 各种加载失败情形 |
 | Real-weight check / 真实权重检查 | `scripts/check_model.py` | BF16 vs the golden files and live HF; float32 vs HF / BF16 对比金标准与现场 HF；float32 对比 HF |
+| KV cache (block-based, contiguous as one block per sequence), prefill and decode, model runner, a static-batch engine / KV cache、prefill 与 decode、模型运行器、静态批引擎 | `src/mini_deepinfer/worker/`, `src/mini_deepinfer/engine/` | Decode with the cache equals a full recompute (float32); greedy tokens equal HF `generate` / 带缓存的 decode 与整段重算一致；greedy 结果与 HF `generate` 一致 |
+| Generation check / 生成检查 | `scripts/check_generate.py` | Free-running and teacher-forced greedy vs the golden files and HF's own decode path / 自由生成与 teacher forcing 对比金标准和 HF 自己的 decode |
 
-Results on an RTX 4060 Laptop (8 GB): both Qwen3-0.6B and Qwen3-1.7B pass. In float32 the logits agree with HF to within about 6e-5 over the whole vocabulary. In BF16 the difference from the golden logits is the same size as HF's own run-to-run difference, and greedy tokens differ only at near-ties.
-在 RTX 4060 Laptop（8 GB）上的结果：Qwen3-0.6B 和 Qwen3-1.7B 都通过。float32 下 logits 与 HF 在整个词表上相差约 6e-5 以内。BF16 下与金标准的差距和 HF 自己重跑的差距同一量级，greedy token 只在前两名几乎相等处不同。
+Results on an RTX 4060 Laptop (8 GB): both Qwen3-0.6B and Qwen3-1.7B pass. In float32 the logits agree with HF to within about 6e-5 over the whole vocabulary. In BF16 the difference from the golden logits is the same size as HF's own difference from them when HF is run now as one full-sequence forward (`scripts/check_model.py`), and greedy tokens differ only at near-ties. Generating with the KV cache reproduces the golden 32-token outputs exactly for 4 of 8 prompts (0.6B) and 6 of 8 (1.7B); every other prompt first differs where the top two golden logits are equal.
+在 RTX 4060 Laptop（8 GB）上的结果：Qwen3-0.6B 和 Qwen3-1.7B 都通过。float32 下 logits 与 HF 在整个词表上相差约 6e-5 以内。BF16 下与金标准的差距，和现在用一次整段前向运行的 HF 与金标准的差距同一量级（`scripts/check_model.py`），greedy token 只在前两名几乎相等处不同。用 KV cache 生成时，0.6B 有 4/8、1.7B 有 6/8 个 prompt 的 32 个 token 与金标准完全一致，其余 prompt 第一次不同都出现在金标准前两名 logits 相等的位置。
 
 Docstrings refer to steps by number (S1.2 = phase 1, step 2). Each module docstring names the DeepInfer file it mirrors and lists every deliberate difference. Where DeepInfer calls a GPU kernel (TileLang, DeepGEMM, FlashMLA), this code uses a short PyTorch stand-in.
 代码注释里用编号指代步骤（S1.2 = 第 1 阶段第 2 步）。每个模块开头写明对应 DeepInfer 的哪个文件，并列出每一处有意的不同。DeepInfer 调用 GPU 算子（TileLang、DeepGEMM、FlashMLA）的地方，这里用几行 PyTorch 代替。
@@ -48,7 +50,11 @@ uv run scripts/check_model.py --model Qwen/Qwen3-0.6B
 uv run scripts/check_model.py --model Qwen/Qwen3-0.6B --fp32
 ```
 
+```bash
+uv run scripts/check_generate.py --model Qwen/Qwen3-0.6B
+```
+
 ## Next / 后续
 
-Prefill and decode with a contiguous KV cache, then a paged KV cache with a block manager and continuous batching, the sampler, CUDA graphs, and DeepSeek-style model pieces (MLA, MoE).
-接下来：连续 KV cache 的 prefill 与 decode，然后是分页 KV cache、块管理器与连续批处理、采样器、CUDA graph，以及 DeepSeek 风格的模型组件（MLA、MoE）。
+A block manager with small blocks, a scheduler with continuous batching, the sampler, CUDA graphs, and DeepSeek-style model pieces (MLA, MoE).
+接下来：小块的块管理器、带连续批处理的调度器、采样器、CUDA graph，以及 DeepSeek 风格的模型组件（MLA、MoE）。
