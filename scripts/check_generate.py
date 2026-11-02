@@ -151,12 +151,13 @@ def main():
     runner = ModelRunner(model_dir, block_size=block_size, max_model_len=args.max_model_len, device=args.device)
     runner.load_model()
     blocks_per_seq = math.ceil(args.max_model_len / block_size)
-    cache = CacheEngine(runner.model.cfg, num_blocks=len(prompts) * blocks_per_seq, block_size=block_size, device=args.device)
+    usable = len(prompts) * blocks_per_seq
+    cache = CacheEngine(runner.model.cfg, num_blocks=usable + 1, block_size=block_size, device=args.device)  # + block 0
     eos_token_id = json.loads((Path(model_dir) / "config.json").read_text())["eos_token_id"]
     engine = StaticEngine(runner, cache, eos_token_id=eos_token_id)
     kv_mib = CacheEngine.get_cache_block_size(block_size, runner.model.cfg) * cache.num_blocks / 2**20
     print(f"{args.model}: {len(prompts)} prompts x {n_tokens} tokens, block_size {block_size}, "
-          f"{cache.num_blocks} blocks ({kv_mib:.0f} MiB of KV cache), device {args.device}")
+          f"{usable} usable blocks + the reserved block 0 ({kv_mib:.0f} MiB of KV cache), device {args.device}")
     run(engine, prompts[:1], 4)  # warm-up
 
     free_tokens, times1 = [], []

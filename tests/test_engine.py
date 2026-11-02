@@ -11,7 +11,8 @@ import math
 import pytest
 import torch
 
-from mini_deepinfer.engine.static_engine import BlockAllocator, StaticEngine, check_stop, process_outputs
+from mini_deepinfer.engine.block_manager import BlockManagerMutexAcquire
+from mini_deepinfer.engine.static_engine import StaticEngine, check_stop, process_outputs
 from mini_deepinfer.model_executor.input_metadata import InputMetadata
 from mini_deepinfer.model_executor.layers.sampler_utils import get_logits
 from mini_deepinfer.sampling_params import SamplingParams
@@ -27,7 +28,7 @@ def make_engine(path, *, block_size=MAX_LEN, num_blocks=None, max_model_len=MAX_
     runner = ModelRunner(path, device=device, block_size=block_size, max_model_len=max_model_len)
     runner.load_model()
     if num_blocks is None:
-        num_blocks = 8 * math.ceil(max_model_len / block_size)
+        num_blocks = 8 * math.ceil(max_model_len / block_size) + 1  # + the reserved block 0
     cache = CacheEngine(runner.model.cfg, num_blocks=num_blocks, block_size=block_size, device=device)
     for layer in cache.gpu_cache:  # any read of a slot that was never written turns the output into NaN
         layer.k_cache.fill_(float("nan"))
@@ -69,6 +70,7 @@ def test_decode_with_cache_matches_full_recompute(tiny_checkpoint, block_size, o
         before = [s.get_token_ids() for s in batch]
         out = engine.step(batch, is_prompt=False)
         assert out.logits.isfinite().all()
+        assert all(0 not in s.cache.block_table for s in seqs)
         for tokens, row in zip(before, out.logits):
             torch.testing.assert_close(row, full_logits(model, tokens), rtol=1e-4, atol=1e-4)
     assert [s.get_token_ids()[s.get_prompt_len() :] for s in seqs] == golden
@@ -113,6 +115,8 @@ def test_chunked_prefill_matches_whole_prefill(tiny_checkpoint, chunks):
         last = i == len(chunks) - 1
         assert seq.num_cached_tokens == sum(chunks[: i + 1])
         assert seq.get_len() == len(prompt) + (1 if last else 0)
+        assert seq.status == (SequenceStatus.RUNNING if last else SequenceStatus.WAITING)
+        assert len(seq.cache.block_table) == 3  # the whole prompt's blocks from the first chunk on
     torch.testing.assert_close(out.logits[0], full_logits(model, prompt), rtol=1e-4, atol=1e-4)
     out = engine.step([seq], is_prompt=False)
     torch.testing.assert_close(out.logits[0], full_logits(model, seq.get_token_ids()[:-1]), rtol=1e-4, atol=1e-4)
@@ -156,7 +160,39 @@ def test_cache_counters_and_blocks(tiny_checkpoint):
         assert seq.num_cached_tokens == seq.get_len() - 1
         assert len(seq.cache.block_table) in (math.ceil(seq.num_cached_tokens / 4), 0)
     assert seq.status == SequenceStatus.FINISHED_LENGTH_CAPPED and seq.get_output_len() == 7
-    assert seq.cache.block_table == [] and engine.allocator.num_free == 10  # blocks returned
+    assert seq.cache.block_table == [] and engine.block_manager.get_num_free_blocks() == 9  # blocks returned
+
+
+def test_status_and_usage(tiny_checkpoint):
+    _, path = tiny_checkpoint()
+    engine = make_engine(path, block_size=4, num_blocks=10)
+    assert engine.get_gpu_cache_usage() == pytest.approx(1 / 10)
+    (seq,) = engine.add_requests([[1, 2, 3, 4, 5]], greedy(max_tokens=3))
+    assert seq.status == SequenceStatus.WAITING and seq.cache.block_table == []
+    engine.step([seq], is_prompt=True)
+    assert seq.status == SequenceStatus.RUNNING and len(seq.cache.block_table) == 2
+    assert engine.get_gpu_cache_usage() == pytest.approx(3 / 10)
+    assert engine.get_gpu_cache_usage(num_gpu_blocks_to_use=2) == pytest.approx(5 / 10)
+
+
+def test_append_slot_grows_by_one_or_trims(tiny_checkpoint):
+    _, path = tiny_checkpoint()
+    engine = make_engine(path, block_size=4, num_blocks=10)
+    (seq,) = engine.add_requests([[1, 2, 3, 4]], greedy())
+    with BlockManagerMutexAcquire(engine.block_manager) as acquire:
+        acquire.allocate_seq(seq)
+        assert seq.cache.block_table == [1]
+        seq.append_token_id(5)  # 5 tokens need 2 blocks
+        engine._append_slot(seq)
+        assert seq.cache.block_table == [1, 2]
+        seq.cache.block_table.append(engine.block_manager.allocate_single_nolock())  # one too many
+        engine._append_slot(seq)
+        assert seq.cache.block_table == [1, 2]
+    assert engine.block_manager.get_num_free_blocks() == 7  # the trimmed block went back
+    for _ in range(8):
+        seq.append_token_id(5)  # 13 tokens need 4 blocks; the table has 2
+    with BlockManagerMutexAcquire(engine.block_manager), pytest.raises(RuntimeError):
+        engine._append_slot(seq)  # one block per call, never more
 
 
 def test_reused_blocks_give_the_same_tokens(tiny_checkpoint):
@@ -185,7 +221,7 @@ def test_stop_on_eos_and_lengths(tiny_checkpoint):
     for _ in range(4):
         engine.step([a], is_prompt=False)
     assert a.status == SequenceStatus.FINISHED_LENGTH_CAPPED and a.get_output_len() == 5  # max_tokens
-    assert engine.allocator.num_free == engine.allocator.num_blocks
+    assert engine.block_manager.get_num_free_blocks() == engine.block_manager.num_blocks - 1
 
 
 def make_seq(prompt_len, sp):
@@ -242,15 +278,78 @@ def test_prepare_input_tensors(tiny_checkpoint):
 
 def test_admission_and_out_of_blocks(tiny_checkpoint):
     _, path = tiny_checkpoint()
-    engine = make_engine(path, block_size=4, num_blocks=4)
+    engine = make_engine(path, block_size=4, num_blocks=4)  # blocks 1-3 usable
     with pytest.raises(ValueError):
         engine.add_requests([[]], greedy())
-    (big,) = engine.add_requests([[1] * 17], greedy())  # needs 5 blocks of 4: can never run
-    assert big.status == SequenceStatus.FINISHED_IGNORED
+    big, fits = engine.add_requests([[1] * 13, [1] * 12], greedy())
+    assert big.status == SequenceStatus.FINISHED_IGNORED  # 4 blocks of 4: can never run
+    assert fits.status == SequenceStatus.WAITING  # 3 blocks: all the usable ones
     a, b = engine.add_requests([[1] * 9, [2] * 9], greedy())  # 3 blocks each: one fits, not both
     with pytest.raises(RuntimeError, match="out of KV-cache blocks"):
         engine.step([a, b], is_prompt=True)
-    assert engine.allocator.num_free == 4 and a.cache.block_table == []  # nothing was taken
+    assert engine.block_manager.get_num_free_blocks() == 3 and a.cache.block_table == []  # nothing was taken
+    assert a.status == b.status == SequenceStatus.WAITING
+    assert engine.block_manager._lock.acquire(blocking=False)  # the failure released the lock
+    engine.block_manager._lock.release()
+
+
+def test_prefill_that_must_wait_takes_nothing(tiny_checkpoint):
+    _, path = tiny_checkpoint()
+    engine = make_engine(path, block_size=4, num_blocks=6)  # 5 usable
+    (x,) = engine.add_requests([[3] * 8], greedy())
+    engine.step([x], is_prompt=True)  # x holds 2 blocks, 3 free
+    a, b = engine.add_requests([[1] * 8, [2] * 8], greedy())  # 2 blocks each: 4 > 3
+    with pytest.raises(RuntimeError, match="out of KV-cache blocks"):
+        engine.step([a, b], is_prompt=True)
+    assert a.cache.block_table == b.cache.block_table == []
+    assert a.status == b.status == SequenceStatus.WAITING
+    assert engine.block_manager.get_num_free_blocks() == 3
+
+
+def test_continued_chunk_needs_no_new_blocks(tiny_checkpoint):
+    _, path = tiny_checkpoint()
+    engine = make_engine(path, block_size=4, num_blocks=6)  # 5 usable
+    a, b = engine.add_requests([[1] * 12, [2] * 8], greedy())
+    engine.step([a], is_prompt=True, seqlens_q=[4])  # a takes all 3 blocks now
+    engine.step([a, b], is_prompt=True, seqlens_q=[8, 8])  # only b needs blocks: 2 of the 2 left
+    assert (len(a.cache.block_table), len(b.cache.block_table)) == (3, 2)
+    assert engine.block_manager.get_num_free_blocks() == 0
+
+
+def test_decode_at_exact_capacity(tiny_checkpoint):
+    _, path = tiny_checkpoint()
+    engine = make_engine(path, block_size=4, num_blocks=4)  # 3 usable
+    a, b = engine.add_requests([[1] * 4, [2] * 2], greedy())
+    engine.step([a, b], is_prompt=True)  # a: 4 tokens -> 1 block (+1 sampled), b: 1 block
+    engine.step([a, b], is_prompt=False)  # a's sampled token needs a 2nd block; b's fits
+    assert (len(a.cache.block_table), len(b.cache.block_table)) == (2, 1)
+    assert engine.block_manager.get_num_free_blocks() == 0
+
+
+def test_decode_out_of_blocks_aborts_and_frees(tiny_checkpoint):
+    _, path = tiny_checkpoint()
+    engine = make_engine(path, block_size=4, num_blocks=3)  # 2 usable
+    a, b = engine.add_requests([[1] * 4, [2] * 4], greedy())
+    engine.step([a, b], is_prompt=True)
+    with pytest.raises(RuntimeError, match="out of KV-cache blocks"):
+        engine.step([a, b], is_prompt=False)  # both need a 2nd block, none is free
+    assert a.status == b.status == SequenceStatus.FINISHED_ABORTED
+    assert a.cache.block_table == b.cache.block_table == []
+    assert engine.block_manager.get_num_free_blocks() == 2
+    with pytest.raises(RuntimeError, match="out of KV-cache blocks"):
+        engine.generate([[1] * 4, [2] * 4], greedy())  # generate() gives nothing back, but frees
+    assert engine.block_manager.get_num_free_blocks() == 2
+
+
+def test_decode_refuses_a_half_prefilled_sequence(tiny_checkpoint):
+    _, path = tiny_checkpoint()
+    engine = make_engine(path, block_size=4)
+    a, b = engine.add_requests([[1] * 7, [2] * 3], greedy())
+    engine.step([a], is_prompt=True, seqlens_q=[3])
+    engine.step([b], is_prompt=True)
+    with pytest.raises(ValueError):
+        engine.step([a, b], is_prompt=False)
+    assert a.status == SequenceStatus.WAITING and b.status == SequenceStatus.RUNNING  # nothing changed
 
 
 def test_failed_step_frees_its_blocks(tiny_checkpoint):
@@ -260,7 +359,7 @@ def test_failed_step_frees_its_blocks(tiny_checkpoint):
         engine.generate([[1, 2, 3]], SamplingParams(temperature=0.7))
     with pytest.raises(NotImplementedError):
         engine.generate([[1, 2, 3]], SamplingParams(temperature=0.0, first_n_token_no_eos=1))
-    assert engine.allocator.num_free == 8
+    assert engine.block_manager.get_num_free_blocks() == 7
     (seq,) = engine.generate([[1, 2, 3]], greedy(max_tokens=2))  # the engine still works
     assert seq.get_output_len() == 2
 
@@ -276,13 +375,6 @@ def test_cache_engine_shapes(tiny_checkpoint):
     assert CacheEngine.get_cache_block_size(4, cfg) == per_block
 
 
-def test_block_allocator_is_fifo():
-    alloc = BlockAllocator(3)
-    assert [alloc.allocate() for _ in range(3)] == [0, 1, 2]
-    alloc.free([1, 0])
-    assert [alloc.allocate(), alloc.allocate()] == [1, 0]
-
-
 @cuda
 def test_forward_on_cuda(tiny_checkpoint):
     _, path = tiny_checkpoint()
@@ -290,7 +382,10 @@ def test_forward_on_cuda(tiny_checkpoint):
     runner = engine.runner
     (seq,) = engine.add_requests(random_prompts([9], runner.model.cfg.vocab_size, seed=7), greedy())
     for is_prompt in (True, False):
-        engine._append_slots(seq)
+        if is_prompt:
+            engine._allocate_prefill([seq], None)
+        else:
+            engine._allocate_decode([seq])
         md = runner.prepare_input_tensors([seq], is_prompt)
         torch.cuda.set_sync_debug_mode("error")
         try:
