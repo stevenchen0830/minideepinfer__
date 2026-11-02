@@ -1,7 +1,7 @@
 [project]
 name = "mini-deepinfer"
 version = "0.1.0"
-description = "Add your description here"
+description = "A small educational rebuild of DeepSeek DeepInfer on one consumer GPU"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
