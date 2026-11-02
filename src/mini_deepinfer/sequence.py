@@ -13,10 +13,15 @@ same names:
 Left out until a later step needs them: speculative-decoding state
 (`MtpState`, including golden tokens), in-flight token counts for overlapped
 scheduling (ZOS, S4.3), structured-output state (S6.3), multimodal input, the
-compressed token stream, sliding-window and state-slot fields, prefix-cache hit
-counts, forking, chunked-prefill checkpoints, and the constructor arguments
-`compressed_prompt_token_ids`, `multi_modal_data`, `user_id` and
-`golden_token_ids`.
+compressed token stream, sliding-window and state-slot fields, chunked-prefill
+checkpoints, and the constructor arguments `compressed_prompt_token_ids`,
+`multi_modal_data`, `user_id` and `golden_token_ids`.
+
+Added in S2.2 for block sharing: `branch_id` (DeepInfer's
+`schedule.branch_id`), `KvCacheState.hit_tokens` (DeepInfer's
+`cache.hit_tokens`, bound as `cached_hit_tokens`), and
+`KvCacheState.block_hashes`, which is ours: DeepInfer's prefix cache lives
+outside the engine (see engine/prefix_cache.py).
 
 Who changes what: the Sequence only stores state. The scheduler (S2.5) moves
 the status and fills and clears `cache.block_table`, using block ids from the
@@ -156,6 +161,15 @@ class KvCacheState:
         # Physical block ids. The scheduler (S2.5) fills it with ids from the
         # block manager (S2.1) and clears it when it frees the sequence.
         self.block_table: list[int] = []
+        # Tokens taken from the prefix cache at this sequence's latest
+        # admission, 0 on a miss; a fork starts with its parent's value (S2.2).
+        # DeepInfer's release only stores and copies it (fork_seq) and exposes
+        # a setter for its external KV store; here the engine's own prefix
+        # cache sets it.
+        self.hit_tokens = 0
+        # Ours (S2.2 prefix cache): the chain hash of each full block whose KV
+        # is cached, in order; entry i covers positions [i*bs, (i+1)*bs).
+        self.block_hashes: list[bytes] = []
 
     def set_num_tokens(self, n: int) -> None:
         """Set the count from outside (DeepInfer: an injected prefix-cache
@@ -172,9 +186,11 @@ class KvCacheState:
 
     def reset_for_recompute(self) -> None:
         """Forget all cached KV. The block table is left alone: the scheduler
-        frees the blocks and clears it separately."""
+        frees the blocks and clears it separately. ``hit_tokens`` is kept, as
+        in DeepInfer; the block hashes go, since no KV is cached any more."""
         self.num_tokens = 0
         self.previous_num_tokens = 0
+        self.block_hashes.clear()
 
 
 # SamplingParams fields that DeepInfer's Sequence constructor copies into C++
@@ -221,6 +237,10 @@ class Sequence:
         self.cache = KvCacheState(block_size)
         self.status: SequenceStatus = SequenceStatus.WAITING
         self._sampling_params = sampling_params
+        # Set by fork_seq (S2.2). A leading "_" marks a fork with more than one
+        # token not yet cached: its next prefill does the copy-on-write and
+        # strips the "_".
+        self.branch_id = "default"
 
     @property
     def sampling_params(self) -> SamplingParams:
@@ -246,6 +266,14 @@ class Sequence:
     @property
     def old_cached_tokens(self) -> int:
         return self.cache.previous_num_tokens
+
+    @property
+    def cached_hit_tokens(self) -> int:
+        return self.cache.hit_tokens
+
+    @cached_hit_tokens.setter
+    def cached_hit_tokens(self, n: int) -> None:
+        self.cache.hit_tokens = n
 
     # Token accessors, delegated to SequenceData.
     def get_len(self) -> int:

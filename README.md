@@ -15,6 +15,7 @@ A small, educational rebuild of [DeepSeek's DeepInfer](https://github.com/deepse
 | Real-weight check / 真实权重检查 | `scripts/check_model.py` | BF16 vs the golden files and live HF; float32 vs HF / BF16 对比金标准与现场 HF；float32 对比 HF |
 | KV cache (block-based, contiguous as one block per sequence), prefill and decode, model runner, a static-batch engine / KV cache、prefill 与 decode、模型运行器、静态批引擎 | `src/mini_deepinfer/worker/`, `src/mini_deepinfer/engine/` | Decode with the cache equals a full recompute (float32); greedy tokens equal HF `generate` / 带缓存的 decode 与整段重算一致；greedy 结果与 HF `generate` 一致 |
 | Block manager: free list with reference counts, OK / LATER / NEVER, reserved block 0 / 块管理器：带引用计数的空闲链表、OK / LATER / NEVER、保留块 0 | `src/mini_deepinfer/engine/block_manager.py` | Randomized test against a reference model, with invariants checked after every operation / 与参考模型对比的随机测试，每步检查不变量 |
+| Block sharing: fork with copy-on-write (as DeepInfer's scheduler does) and a hash-chain prefix cache (ours, as in vLLM; DeepInfer keeps its own outside the engine) / 块共享：写时复制的 fork（与 DeepInfer 调度器相同）和哈希链前缀缓存（自己实现，做法同 vLLM；DeepInfer 的放在引擎之外） | `src/mini_deepinfer/engine/static_engine.py`, `src/mini_deepinfer/engine/prefix_cache.py`, `scripts/check_sharing.py` | Every step against a full recompute plus a write rule (`check_writes`), randomized; on real weights, forks with the same tokens are bit-identical to their parents / 每一步对照整段重算并检查写入规则，随机测试；真实权重下 token 相同的 fork 与父请求逐位相同 |
 | Generation check / 生成检查 | `scripts/check_generate.py` | Free-running and teacher-forced greedy vs the golden files and HF's own decode path / 自由生成与 teacher forcing 对比金标准和 HF 自己的 decode |
 
 Results on an RTX 4060 Laptop (8 GB): both Qwen3-0.6B and Qwen3-1.7B pass. In float32 the logits agree with HF to within about 6e-5 over the whole vocabulary. In BF16 the difference from the golden logits is the same size as HF's own difference from them when HF is run now as one full-sequence forward (`scripts/check_model.py`), and greedy tokens differ only at near-ties. Generating with the KV cache reproduces the golden 32-token outputs exactly for 4 of 8 prompts (0.6B) and 6 of 8 (1.7B); every other prompt first differs where the top two golden logits are equal.
@@ -55,7 +56,11 @@ uv run scripts/check_model.py --model Qwen/Qwen3-0.6B --fp32
 uv run scripts/check_generate.py --model Qwen/Qwen3-0.6B
 ```
 
+```bash
+uv run scripts/check_sharing.py --model Qwen/Qwen3-0.6B
+```
+
 ## Next / 后续
 
-Block sharing (fork, prefix cache), a scheduler with continuous batching, the sampler, CUDA graphs, and DeepSeek-style model pieces (MLA, MoE).
-接下来：块共享（fork、前缀缓存）、带连续批处理的调度器、采样器、CUDA graph，以及 DeepSeek 风格的模型组件（MLA、MoE）。
+A scheduler with continuous batching, the sampler, CUDA graphs, and DeepSeek-style model pieces (MLA, MoE).
+接下来：带连续批处理的调度器、采样器、CUDA graph，以及 DeepSeek 风格的模型组件（MLA、MoE）。

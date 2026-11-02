@@ -24,7 +24,16 @@ MAX_LEN = 64
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 
-def make_engine(path, *, block_size=MAX_LEN, num_blocks=None, max_model_len=MAX_LEN, eos_token_id=0, device="cpu"):
+def make_engine(
+    path,
+    *,
+    block_size=MAX_LEN,
+    num_blocks=None,
+    max_model_len=MAX_LEN,
+    eos_token_id=0,
+    device="cpu",
+    enable_prefix_caching=False,
+):
     runner = ModelRunner(path, device=device, block_size=block_size, max_model_len=max_model_len)
     runner.load_model()
     if num_blocks is None:
@@ -33,7 +42,7 @@ def make_engine(path, *, block_size=MAX_LEN, num_blocks=None, max_model_len=MAX_
     for layer in cache.gpu_cache:  # any read of a slot that was never written turns the output into NaN
         layer.k_cache.fill_(float("nan"))
         layer.v_cache.fill_(float("nan"))
-    return StaticEngine(runner, cache, eos_token_id=eos_token_id)
+    return StaticEngine(runner, cache, eos_token_id=eos_token_id, enable_prefix_caching=enable_prefix_caching)
 
 
 def greedy(max_tokens=8, **kw):

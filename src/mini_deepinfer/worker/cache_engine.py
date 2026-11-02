@@ -58,6 +58,38 @@ class CacheEngine:
             for _ in range(cfg.num_hidden_layers)
         ]
 
+    def clone_blocks(self, clone_blocks: list[tuple[int, int]]) -> list[int]:
+        """Copy-on-write copies for forked sequences (S2.2).
+
+        The block part of DeepInfer's ``clone_and_zero_states_and_blocks``
+        (csrc/engine/scheduler.hpp): each ``(src, dst)`` pair copies block
+        ``src`` into block ``dst`` in every layer's K and V; ``dst == 0`` means
+        "no copy, only release ``src``". Returns every ``src``: the caller
+        unpins them once the copies are done (DeepInfer: after a CUDA event,
+        in the same step's ``pre_sampler_sync``).
+
+        DeepInfer issues one ``cudaMemcpyAsync`` per pair over its block-major
+        buffer, in order. Here one gather and one scatter per tensor do all
+        pairs at once. A block that is both a source and a destination, or a
+        destination twice, is refused; the scheduler never produces either.
+        """
+        srcs = [src for src, _ in clone_blocks]
+        copies = [(src, dst) for src, dst in clone_blocks if dst]
+        if copies:
+            dsts = [dst for _, dst in copies]
+            if len(set(dsts)) != len(dsts) or set(dsts) & {src for src, _ in copies}:
+                raise ValueError(f"overlapping clone pairs: {copies}")
+            device = self.gpu_cache[0].k_cache.device
+            index = torch.tensor(copies, dtype=torch.long)
+            if device.type == "cuda":
+                index = index.pin_memory()
+            index = index.to(device, non_blocking=True)
+            src_idx, dst_idx = index[:, 0], index[:, 1]
+            for layer in self.gpu_cache:
+                for cache in (layer.k_cache, layer.v_cache):
+                    cache.index_copy_(0, dst_idx, cache.index_select(0, src_idx))
+        return srcs
+
     def __getitem__(self, layer_idx: int) -> KVCache:
         return self.gpu_cache[layer_idx]
 
